@@ -1,6 +1,4 @@
 import express from "express";
-import twilio from "twilio";
-import Anthropic from "@anthropic-ai/sdk";
 import { chromium } from "playwright";
 import dotenv from "dotenv";
 import fs from "fs";
@@ -8,278 +6,222 @@ import fs from "fs";
 dotenv.config();
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
-// Load saved order profiles
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const PROFILES_FILE = "./profiles.json";
+
+// â”€â”€â”€ Profile Storage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function loadProfiles() {
   if (!fs.existsSync(PROFILES_FILE)) return {};
   return JSON.parse(fs.readFileSync(PROFILES_FILE, "utf8"));
 }
-function saveProfiles(profiles) {
-  fs.writeFileSync(PROFILES_FILE, JSON.stringify(profiles, null, 2));
+function saveProfiles(p) {
+  fs.writeFileSync(PROFILES_FILE, JSON.stringify(p, null, 2));
 }
 
-// Parse order intent with Claude
-async function parseOrderIntent(message, phone) {
-  const profiles = loadProfiles();
-  const profile = profiles[phone] || {};
-
-  const systemPrompt = `You are a food ordering assistant. Parse the user's text message into a structured order.
-Extract:
-- restaurant: the restaurant name (null if not specified)
-- items: array of food items they want (empty array if just saying "usual" or "same as before")
-- isUsual: true if they want their usual/regular order
-- isSetup: true if they're trying to set up their profile/preferences
-- deliveryAddress: address if mentioned (null otherwise)
-
-User's saved profile: ${JSON.stringify(profile)}
-
-Respond ONLY with valid JSON like:
-{"restaurant": "Delhi Street", "items": ["butter chicken", "naan"], "isUsual": false, "isSetup": false, "deliveryAddress": null}`;
-
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 500,
-    system: systemPrompt,
-    messages: [{ role: "user", content: message }],
-  });
-
-  const text = response.content[0].text.trim();
-  const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
-}
-
-// Send SMS reply
-async function sendSMS(to, message) {
-  await twilioClient.messages.create({
-    body: message,
-    from: process.env.TWILIO_PHONE_NUMBER,
-    to,
+// â”€â”€â”€ Telegram Messaging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function sendMessage(chatId, text) {
+  await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text }),
   });
 }
 
-// Place order via DoorDash browser automation
-async function placeOrderOnDoorDash(orderIntent, phone) {
-  const profiles = loadProfiles();
-  const profile = profiles[phone];
+// â”€â”€â”€ Simple Free Text Parser (no AI needed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function parseOrder(message) {
+  const msg = message.toLowerCase().trim();
 
-  if (!profile?.doordashEmail || !profile?.doordashPassword) {
-    throw new Error("NO_PROFILE");
+  // "usual" / "lunch" / "dinner" / "order me food" â†’ usual order
+  const usualTriggers = ["usual", "lunch", "dinner", "breakfast", "food", "hungry", "order me", "get me food"];
+  const isUsual = usualTriggers.some((t) => msg.includes(t)) && !msg.includes(" from ");
+
+  // "order [item] from [restaurant]"
+  const fromMatch = msg.match(/(?:order|get|want|gimme|i want)(.*?)from\s+(.+)/i);
+  if (fromMatch) {
+    const items = fromMatch[1].trim().split(/,|and/).map((i) => i.trim()).filter(Boolean);
+    const restaurant = fromMatch[2].trim();
+    return { isUsual: false, items, restaurant };
   }
 
-  const restaurant = orderIntent.isUsual ? profile.usualRestaurant : orderIntent.restaurant;
-  const items = orderIntent.isUsual ? profile.usualItems : orderIntent.items;
-  const address = orderIntent.deliveryAddress || profile.defaultAddress;
+  // "order from [restaurant]"
+  const restaurantOnly = msg.match(/(?:order|get me).+from\s+(.+)/i);
+  if (restaurantOnly) {
+    return { isUsual: true, items: [], restaurant: restaurantOnly[1].trim() };
+  }
+
+  return { isUsual, items: [], restaurant: null };
+}
+
+// â”€â”€â”€ DoorDash Automation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function placeOrder(chatId, orderIntent) {
+  const profiles = loadProfiles();
+  const profile = profiles[chatId];
+
+  if (!profile?.doordashEmail) throw new Error("NO_PROFILE");
+
+  const restaurant = orderIntent.restaurant || profile.usualRestaurant;
+  const items = orderIntent.items.length ? orderIntent.items : profile.usualItems;
+  const address = profile.defaultAddress;
 
   if (!restaurant) throw new Error("NO_RESTAURANT");
   if (!address) throw new Error("NO_ADDRESS");
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
   const context = await browser.newContext();
   const page = await context.newPage();
 
   try {
-    // 1. Go to DoorDash and log in
+    // Login
     await page.goto("https://www.doordash.com/consumer/login/", { waitUntil: "networkidle" });
     await page.fill('input[name="email"]', profile.doordashEmail);
     await page.fill('input[name="password"]', profile.doordashPassword);
     await page.click('button[type="submit"]');
     await page.waitForNavigation({ waitUntil: "networkidle" });
 
-    // 2. Search for the restaurant
+    // Search restaurant
     await page.goto(`https://www.doordash.com/search/store/${encodeURIComponent(restaurant)}/`, {
       waitUntil: "networkidle",
     });
-
-    // Click first restaurant result
     const firstResult = page.locator('[data-testid="store-card"]').first();
     await firstResult.waitFor({ timeout: 10000 });
     await firstResult.click();
     await page.waitForLoadState("networkidle");
 
-    // 3. Add items to cart
+    // Add items
     for (const item of items) {
-      const itemSearch = page.locator(`text=${item}`).first();
       try {
-        await itemSearch.waitFor({ timeout: 5000 });
-        await itemSearch.click();
-        // Handle any modifier dialogs (just click confirm/add)
+        const el = page.locator(`text=${item}`).first();
+        await el.waitFor({ timeout: 5000 });
+        await el.click();
         const addBtn = page.locator('button:has-text("Add to Order"), button:has-text("Add")').first();
-        if (await addBtn.isVisible({ timeout: 2000 })) {
-          await addBtn.click();
-        }
+        if (await addBtn.isVisible({ timeout: 2000 })) await addBtn.click();
         await page.waitForTimeout(1000);
       } catch {
         console.log(`Item not found: ${item}`);
       }
     }
 
-    // 4. Go to checkout
+    // Checkout
     const checkoutBtn = page.locator('button:has-text("Go to Checkout"), a:has-text("Go to Checkout")').first();
     await checkoutBtn.waitFor({ timeout: 10000 });
     await checkoutBtn.click();
     await page.waitForLoadState("networkidle");
 
-    // 5. Confirm delivery address
-    const addressField = page.locator('input[placeholder*="address"], input[name*="address"]').first();
-    if (await addressField.isVisible({ timeout: 3000 })) {
-      await addressField.fill(address);
-      await page.waitForTimeout(1500);
-      const suggestion = page.locator('[data-testid="address-suggestion"]').first();
-      if (await suggestion.isVisible({ timeout: 2000 })) {
-        await suggestion.click();
-      }
-    }
-
-    // 6. Get order total before placing
-    let orderTotal = "unknown";
+    // Get total
+    let orderTotal = "";
     try {
-      const totalEl = page.locator('[data-testid="order-total"], .order-total').first();
-      orderTotal = await totalEl.textContent({ timeout: 3000 });
+      orderTotal = await page.locator('[data-testid="order-total"]').first().textContent({ timeout: 3000 });
     } catch {}
 
-    // 7. Place the order (use saved payment)
-    const placeOrderBtn = page
-      .locator('button:has-text("Place Order"), button:has-text("Confirm Order")')
-      .first();
-    await placeOrderBtn.waitFor({ timeout: 10000 });
-    await placeOrderBtn.click();
+    // Place order
+    const placeBtn = page.locator('button:has-text("Place Order"), button:has-text("Confirm Order")').first();
+    await placeBtn.waitFor({ timeout: 10000 });
+    await placeBtn.click();
     await page.waitForLoadState("networkidle");
 
-    // 8. Get confirmation / ETA
+    // Get ETA
     let eta = "30-45 minutes";
     try {
-      const etaEl = page
-        .locator('[data-testid="delivery-eta"], :has-text("minutes"), :has-text("arriving")')
-        .first();
-      eta = await etaEl.textContent({ timeout: 5000 });
+      eta = await page.locator('[data-testid="delivery-eta"]').first().textContent({ timeout: 5000 });
     } catch {}
 
     await browser.close();
-    return { success: true, restaurant, items, orderTotal, eta, address };
+    return { restaurant, items, orderTotal, eta, address };
   } catch (err) {
     await browser.close();
     throw err;
   }
 }
 
-// Handle setup flow
-async function handleSetup(phone, message) {
+// â”€â”€â”€ Setup Flow â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function handleSetup(chatId, message) {
   const profiles = loadProfiles();
-  const profile = profiles[phone] || { setupStep: "start" };
-
+  const profile = profiles[chatId] || {};
   const step = profile.setupStep || "start";
 
-  if (step === "start" || message.toLowerCase().includes("setup")) {
-    profiles[phone] = { ...profile, setupStep: "email" };
+  const next = (update, reply) => {
+    profiles[chatId] = { ...profile, ...update };
     saveProfiles(profiles);
-    return "Welcome! Let's set up your food bot 🍕\n\nStep 1/5: What's your DoorDash email?";
-  }
+    return reply;
+  };
 
-  if (step === "email") {
-    profiles[phone] = { ...profile, doordashEmail: message.trim(), setupStep: "password" };
-    saveProfiles(profiles);
-    return "Got it! Step 2/5: What's your DoorDash password?\n\n(This is stored locally on your server only)";
+  if (step === "start" || message.toLowerCase() === "setup") {
+    return next({ setupStep: "email" },
+      "ðŸ‘‹ Welcome! Let's set up your food bot.\n\nStep 1/5: What's your DoorDash email?");
   }
-
-  if (step === "password") {
-    profiles[phone] = { ...profile, doordashPassword: message.trim(), setupStep: "address" };
-    saveProfiles(profiles);
-    return "Step 3/5: What's your default delivery address?";
-  }
-
-  if (step === "address") {
-    profiles[phone] = { ...profile, defaultAddress: message.trim(), setupStep: "restaurant" };
-    saveProfiles(profiles);
-    return "Step 4/5: What's your usual restaurant? (e.g., Delhi Street)";
-  }
-
-  if (step === "restaurant") {
-    profiles[phone] = { ...profile, usualRestaurant: message.trim(), setupStep: "items" };
-    saveProfiles(profiles);
-    return "Step 5/5: What's your usual order? List items separated by commas.\n(e.g., butter chicken, garlic naan, mango lassi)";
-  }
-
+  if (step === "email") return next({ doordashEmail: message, setupStep: "password" },
+    "Step 2/5: What's your DoorDash password?\n(Stored only on your server)");
+  if (step === "password") return next({ doordashPassword: message, setupStep: "address" },
+    "Step 3/5: What's your default delivery address?");
+  if (step === "address") return next({ defaultAddress: message, setupStep: "restaurant" },
+    "Step 4/5: What's your usual restaurant? (e.g. Delhi Street)");
+  if (step === "restaurant") return next({ usualRestaurant: message, setupStep: "items" },
+    "Step 5/5: What's your usual order? Separate items with commas.\n(e.g. butter chicken, garlic naan)");
   if (step === "items") {
     const items = message.split(",").map((i) => i.trim());
-    profiles[phone] = { ...profile, usualItems: items, setupStep: "done" };
-    saveProfiles(profiles);
-    return `✅ All set! Your profile is saved.\n\nNow just text me things like:\n• "order me lunch"\n• "get me my usual"\n• "order butter chicken from Delhi Street"\n• "order dinner from [any restaurant]"`;
+    return next({ usualItems: items, setupStep: "done" },
+      `âœ… You're all set!\n\nNow just message me things like:\nâ€¢ "order me lunch"\nâ€¢ "get me my usual"\nâ€¢ "order butter chicken from Delhi Street"\nâ€¢ "order dinner from anywhere"`);
   }
-
   return null;
 }
 
-// Main SMS webhook
-app.post("/sms", async (req, res) => {
-  const phone = req.body.From;
-  const message = req.body.Body?.trim();
+// â”€â”€â”€ Telegram Webhook â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+app.post("/telegram", async (req, res) => {
+  res.sendStatus(200);
 
-  res.status(200).send("<Response></Response>"); // Respond to Twilio immediately
+  const msg = req.body?.message;
+  if (!msg) return;
+
+  const chatId = msg.chat.id;
+  const text = msg.text?.trim();
+  if (!text) return;
+
+  const profiles = loadProfiles();
+  const profile = profiles[chatId] || {};
+  const isSettingUp = profile.setupStep && profile.setupStep !== "done";
 
   try {
-    const profiles = loadProfiles();
-    const profile = profiles[phone] || {};
-    const isSettingUp = profile.setupStep && profile.setupStep !== "done";
-
-    // Handle setup flow
-    if (isSettingUp || message?.toLowerCase().includes("setup")) {
-      const reply = await handleSetup(phone, message);
-      if (reply) await sendSMS(phone, reply);
+    if (isSettingUp || text.toLowerCase() === "setup") {
+      const reply = await handleSetup(chatId, text);
+      if (reply) await sendMessage(chatId, reply);
       return;
     }
 
-    // Check profile exists
     if (!profile.doordashEmail) {
-      await sendSMS(
-        phone,
-        "Hey! I need to set up your profile first.\nText me \"setup\" to get started 🍕"
-      );
+      await sendMessage(chatId, 'Hey! Send me "setup" first so I can save your details ðŸ•');
       return;
     }
 
-    // Parse the order intent
-    await sendSMS(phone, "Got it! Placing your order now... 🛵");
+    await sendMessage(chatId, "Got it! Placing your order now... ðŸ›µ");
 
-    const orderIntent = await parseOrderIntent(message, phone);
+    const orderIntent = parseOrder(text);
+    const result = await placeOrder(chatId, orderIntent);
 
-    if (orderIntent.isSetup) {
-      const reply = await handleSetup(phone, message);
-      if (reply) await sendSMS(phone, reply);
-      return;
-    }
-
-    // Place the order
-    const result = await placeOrderOnDoorDash(orderIntent, phone);
-
-    await sendSMS(
-      phone,
-      `✅ Order placed!\n\n🍽️ ${result.restaurant}\n📦 ${result.items.join(", ")}\n📍 ${result.address}\n💰 ${result.orderTotal}\n⏱️ ETA: ${result.eta}\n\nEnjoy your meal! 🎉`
+    await sendMessage(chatId,
+      `âœ… Order placed!\n\nðŸ½ ${result.restaurant}\nðŸ“¦ ${result.items.join(", ")}\nðŸ“ ${result.address}\nðŸ’° ${result.orderTotal}\nâ± ETA: ${result.eta}\n\nEnjoy! ðŸŽ‰`
     );
   } catch (err) {
-    console.error("Order error:", err);
-
-    let errorMsg = "❌ Something went wrong placing your order. Try again or check your DoorDash app.";
-
-    if (err.message === "NO_PROFILE") {
-      errorMsg = "You need to set up your profile first. Text \"setup\" to get started.";
-    } else if (err.message === "NO_RESTAURANT") {
-      errorMsg = "Which restaurant would you like to order from?";
-    } else if (err.message === "NO_ADDRESS") {
-      errorMsg = "I don't have a delivery address saved. Text \"setup\" to add one.";
-    }
-
-    await sendSMS(phone, errorMsg);
+    const msgs = {
+      NO_PROFILE: 'Send "setup" to get started.',
+      NO_RESTAURANT: "Which restaurant do you want to order from?",
+      NO_ADDRESS: 'No delivery address saved. Send "setup" to add one.',
+    };
+    await sendMessage(chatId, msgs[err.message] || "âŒ Something went wrong. Try again!");
   }
 });
 
-// Health check
-app.get("/", (req, res) => res.json({ status: "Food bot running 🍕" }));
+app.get("/", (_, res) => res.send("ðŸ• Food bot is running!"));
 
+// Register Telegram webhook on startup
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Food bot listening on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Running on port ${PORT}`);
+  const url = process.env.PUBLIC_URL;
+  if (url) {
+    await fetch(`${TELEGRAM_API}/setWebhook?url=${url}/telegram`);
+    console.log(`Telegram webhook set to ${url}/telegram`);
+  }
+});
